@@ -10,8 +10,9 @@ def main():
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
+        "你好！！",
         "introduce yourself",
-        "list all prime numbers within 100",
+        # "list all prime numbers within 100",
     ]
     prompts = [
         tokenizer.apply_chat_template(
@@ -21,6 +22,7 @@ def main():
         )
         for prompt in prompts
     ]
+
     outputs = llm.generate(prompts, sampling_params)
 
     for prompt, output in zip(prompts, outputs):
