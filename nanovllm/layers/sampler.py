@@ -3,6 +3,9 @@ from torch import nn
 
 
 class Sampler(nn.Module):
+    r"""
+    用来从模型输出的 logits 里采样下一个 token 
+    """
 
     def __init__(self):
         super().__init__()

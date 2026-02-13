@@ -21,12 +21,17 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+        ## tp
+        # model_running有多个
+        # 除了LLMEngine成员持有一个外。当tp大于1的时候，还创建了多进程，每个进程都有一个ModelRunner在运行
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
+
+        ## 三大成员：model_runner、tokenizer、scheduler
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -37,18 +42,29 @@ class LLMEngine:
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
+            # join() 会阻塞当前线程，直到子进程结束
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
+            # prompt 从字符串转成数字形式的 token_id
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
     def step(self):
+        # seqs 是 list[Sequence] 
+        # 有一个 prompt 就会有一个 Sequence 对象
         seqs, is_prefill = self.scheduler.schedule()
+        # 执行模型的前向传播，具体的推理逻辑
+        ## 可以表示的多个 prompt 的结果
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # 调用 postprocess，把这次生成的 token_id 追加到 seq 中
         self.scheduler.postprocess(seqs, token_ids)
+
+        # 判断每个 seq 是否达到了完成状态，如果某个 seq 完成了，则构造成 outputs 的输出
+        ## attention：
+        ## token_id 是包含 prompt 的 token_id，completion_token_ids 用来返回纯生成的 token_id
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
@@ -64,8 +80,10 @@ class LLMEngine:
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        # 先把采样参数转成数组，和 prompts 的数量相同
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        # 原始 prompt 和采样参数一起传入 add_request
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
@@ -86,7 +104,12 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
+
+        # 每个 prompt 推理完成的时候，output 才有值
+        # 也就是说中间状态都是空列表。此时根据 seq_id,对 outputs 重排序，从 dict 改成 list 结构
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+
+        # 从 token_id 转成对应的人类可读的 token
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()

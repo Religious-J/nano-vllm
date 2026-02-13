@@ -15,6 +15,8 @@ from nanovllm.utils.loader import load_model
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        
+        ## NOTE. hcf_config 才是模型的 config.json 对应的对象
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -23,21 +25,30 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # torch 相关的初始化
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(hf_config.torch_dtype) # type: ignore
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        # capture_cudagraph 去捕获 CUDA Graph
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # word_size <= tensor_parallel_size
+        ## rank=0 的是主进程，它会创建共享内存（ShredMemory)。
+        ## 其余 rank 的进程是 worker 进程，它们会和共享内存进行通信。
+        ## ModelRunner 推理的主逻辑，其实只和 rank=0 的进程来通信，该进程会收集每个 worker 进程的结果，然后一起返回。
+        
+        # GPU 之间的通信有两个介质，一个是共享内存，它用来分发rank=0的进程下发的控制指令。
+        # 另外一个介质是 NCCL 用来在 GPU 间传输数据 (eg. NCCL all-reduce)
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -188,9 +199,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # ! 是否使用 CUDA Graph
+        ## ps. 512 is 设置的 CUDA Graph 可录制的最大的size. <= capture_cudagraph()
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            ## 相当于:
+            # hidden_states = self.model(input_ids, positions)  ## 调用对应的模型类型对象进行前向传播!!
+            # return self.model.compute_logits(hidden_states)  ## to vocab_size ??
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # CUDA Graph !!
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -206,7 +223,12 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 准备 input_ids，参数 is_prefill 表示当前是 prefill 阶段还是 decode 阶段，会调用不同的 prepare 函数。
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # 主进程（rank=0) 的时候才需要构造温度对象
+        # 因为温度属于 forward 完成后的 后处理 中才需要用的
+        # 即使模型权重被切分到不同卡上，这里做的也只是 forward 的过程。
+        # 最后的后处理逻辑只能在一张卡上完成，也就主进程上。
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None

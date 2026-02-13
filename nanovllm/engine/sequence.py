@@ -12,6 +12,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    # 块大小
     block_size = 256
     counter = count()
 
@@ -28,6 +29,7 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
+    # 魔术方法: 没有显式调用它，但 Python 会在特定场景下自动调用
     def __len__(self):
         return self.num_tokens
 
@@ -50,18 +52,25 @@ class Sequence:
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
 
+    # 已缓存的块数量
+    # 前缀（Prefix）Cache
     @property
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
 
+    # 属性是变量
     @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
+    # 最后一个块内的 token 数
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+    # 参数 i，即 Sequence 对象用的块的下标（索引）。然后返回这个块里面的所有 token_id
+    # NOTE. Sequence 里面的 block，是虚拟的 block，是根据 block 的 size，对于 Sequence 的 token_id 划分的虚拟 block
+    # 此时可能还未分配真实的 block 资源。分配的逻辑在 BlockManager 中。
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
